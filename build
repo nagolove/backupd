@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+clang -Wall -o backupd backupd.c
