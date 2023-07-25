@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-clang -Wall -o backupd backupd.c
+clang -Wall -g -fsanitize=address -o backupd backupd.c

@@ -1,17 +1,46 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <assert.h>
 #include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <stdbool.h>
 
 static const char *card_dest = "/run/media/nagolove/4A3F-0331/";
+
+static const char *replacer_love() {
+    static char buf[128] = {};
+    sprintf(buf, "love");
+    return buf;
+}
 
 static const char *replacer_kiss() {
     static char buf[128] = {};
     sprintf(buf, "kiss");
     return buf;
+}
+
+static char dir_stack[128][128];
+static int dir_stack_pos = 0;
+
+static const char *replacer_pushd() {
+    char buf[128] = {};
+    getcwd(buf, sizeof(buf));
+    strcpy(dir_stack[dir_stack_pos++], buf);
+    return NULL;
+}
+
+static const char *replacer_popd() {
+    if (dir_stack_pos) {
+        chdir(dir_stack[dir_stack_pos--]);
+    }
+    return NULL;
+}
+
+static const char *replacer_cd2sdcard() {
+    chdir(card_dest);
+    return NULL;
 }
 
 static const char *replacer_date() {
@@ -25,6 +54,9 @@ static const char *replacer_date() {
     return buf;
 }
 
+// XXX: Обрати внимание, как будет работать замена при наличии шаблонов
+// $MAKE, $MAK, $MA
+// Гарантировано работает только с разными шаблонами.
 static struct {
     const char *pattern;
     const char *(*fun)();
@@ -34,53 +66,137 @@ static struct {
         .fun = replacer_date,
     },
     {
+        .pattern = "$CD2SDCARD",
+        .fun = replacer_cd2sdcard,
+    },
+    {
+        .pattern = "$PUSHD",
+        .fun = replacer_pushd,
+    },
+    {
+        .pattern = "$POPD",
+        .fun = replacer_popd,
+    },
+    /*
+    {
         .pattern = "$KISS",
         .fun = replacer_kiss,
     },
+    {
+        .pattern = "$LOVE",
+        .fun = replacer_love,
+    },
+    */
 };
 
 // Действия выполняются находясь в каталоге флешки
+// $SOME_TEXT -> fun()
 static const char *actions[] = {
+    "$PUSHD",
+    "$CD2SDCARD",
     "git clone /home/nagolove/ $DATE XXX",
-    "$DATE$DATEYYYY",
-    "$DATE$DATE",
+    "$POPD"
+    /*
+    "$DATE Z $DATE YYYY",
+    "III$DATE$DATE",
     "$KISS_$DATE",
+    "$DATE_$KISS",
+    "$KISS $DATE",
+    "$DATE $KISS",
     "$KISS",
+    "$LOVEDATE$LOVE",
+    "$LOVE$KISS",
+    // */
 };
 
+// Находит самый слева расположенный шаблон из всех для данной строки.
+// Возвращает указатель на начало найденной строки и значение индекса массива
+// replacers с найденным шаблоном.
+static const char *find_leftest(const char *in, int *i) {
+    assert(in);
+    assert(i);
+    //printf("find_leftest: '%s'\n", in);
+    int replacers_num = sizeof(replacers) / sizeof(replacers[0]);
+    char *positions[replacers_num];
+    int positions_i[replacers_num];
+
+    memset(positions, 0, sizeof(positions));
+    memset(positions_i, 0, sizeof(positions_i));
+
+    for (int j = 0; j < replacers_num; j++) {
+        positions[j] = strstr(in, replacers[j].pattern);
+        positions_i[j] = j;
+    }
+
+    const char *leftest = in + strlen(in);
+    //printf("find_leftest: '%s'\n", leftest);
+    for (int j = 0; j < replacers_num; j++) {
+        if (positions[j] && positions[j] < leftest) {
+            leftest = positions[j];
+            *i = positions_i[j];
+        }
+    }
+    //printf("find_leftest: leftest '%s'\n", leftest);
+    if (strlen(leftest) < 1)
+        return NULL;
+    return leftest;
+}
+
+// CHALLENGE: do resolve() recursive!
 static const char *resolve(const char *in) {
     static char buf[256] = {};
     memset(buf, 0, sizeof(buf));
     char *pbuf = buf;
     const char *pin = in;
     int replacers_num = sizeof(replacers) / sizeof(replacers[0]);
-    while (pbuf < buf + sizeof(buf)) {
-        for (int i = 0; i < replacers_num; i++) {
-            const char *point = strstr(pin, replacers[i].pattern);
-            if (point) {
-                printf("resolve: point %s\n", point);
-                int pattern_len = strlen(replacers[i].pattern);
-                printf("resolve: pattern_len %d\n", pattern_len);
-                int pattern_pos = point - pin;
-                printf("resolve: pattern_pos %d\n", pattern_pos);
-                int j = 0;
-                printf("resolve: pbuf '%s'\n", pbuf);
-                for (j = 0; j < pattern_pos; j++) {
-                    *pbuf++ = pin[j];
-                }
-                printf("resolve: pbuf '%s'\n", pbuf);
-                strcat(pbuf, replacers[i].fun());
-                printf("resolve: pbuf '%s'\n", pbuf);
-                j += pattern_len;
-                for (; j < pattern_pos; j++) {
-                    *pbuf++ = pin[j];
-                }
-                printf("resolve: pbuf '%s'\n", pbuf);
-                pin += pattern_len;
+
+    int chunks_max = 128;
+    char *chunks[chunks_max];
+    memset(chunks, 0, sizeof(chunks));
+    int chunks_num = 0;
+
+    while (*pin) {
+        bool found = false;
+
+        int i = -1;
+        const char *pattern = find_leftest(pin, &i);
+        //printf("i %d\n", i);
+        if (pattern) {
+            int pattern_len = strlen(replacers[i].pattern);
+
+            chunks[chunks_num] = strndup(pin, pattern - pin);
+            chunks_num++;
+
+            pin += pattern - pin;
+
+            const char *fun_value = replacers[i].fun();
+            if (fun_value) {
+                chunks[chunks_num] = strdup(fun_value);
+                /*strcpy(chunks[chunks_num], replacers[i].fun());*/
+                chunks_num++;
             }
+
+            pin += pattern_len;
+            found = true;
+        }
+
+        if (!found && pin) {
+            printf("pin '%s'\n", pin);
+            chunks[chunks_num++] = strdup(pin);
+            break;
         }
     }
-    printf("resolve: buf '%s'\n", buf);
+
+    for (int i = 0; i < chunks_num; i++) {
+        //printf("chunk[%d] '%s'\n", i, chunks[i]);
+        strcat(buf, chunks[i]);
+    }
+
+    for (int i = 0; i < chunks_num; i++)
+        if (chunks[i])
+            free(chunks[i]);
+
+    //printf("resolve: buf '%s'\n", buf);
     return buf;
 }
 
