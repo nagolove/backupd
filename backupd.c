@@ -45,35 +45,38 @@ static const char *actions[] = {
     "$DATE$DATEYYYY",
     "$DATE$DATE",
     "$KISS_$DATE",
+    "$KISS",
 };
 
 static const char *resolve(const char *in) {
     static char buf[256] = {};
     memset(buf, 0, sizeof(buf));
     char *pbuf = buf;
+    const char *pin = in;
     int replacers_num = sizeof(replacers) / sizeof(replacers[0]);
     while (pbuf < buf + sizeof(buf)) {
         for (int i = 0; i < replacers_num; i++) {
-            const char *point = strstr(in, replacers[i].pattern);
+            const char *point = strstr(pin, replacers[i].pattern);
             if (point) {
                 printf("resolve: point %s\n", point);
                 int pattern_len = strlen(replacers[i].pattern);
                 printf("resolve: pattern_len %d\n", pattern_len);
-                int pattern_pos = point - in;
+                int pattern_pos = point - pin;
                 printf("resolve: pattern_pos %d\n", pattern_pos);
                 int j = 0;
                 printf("resolve: pbuf '%s'\n", pbuf);
                 for (j = 0; j < pattern_pos; j++) {
-                    *pbuf++ = in[j];
+                    *pbuf++ = pin[j];
                 }
                 printf("resolve: pbuf '%s'\n", pbuf);
                 strcat(pbuf, replacers[i].fun());
                 printf("resolve: pbuf '%s'\n", pbuf);
                 j += pattern_len;
                 for (; j < pattern_pos; j++) {
-                    *pbuf++ = in[j];
+                    *pbuf++ = pin[j];
                 }
                 printf("resolve: pbuf '%s'\n", pbuf);
+                pin += pattern_len;
             }
         }
     }
