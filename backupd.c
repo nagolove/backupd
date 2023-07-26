@@ -14,6 +14,7 @@ struct Script {
     int lines_num;
 };
 
+static const char *lock_name = ".backupd.lock";
 static const char *script_name = ".backupdrc";
 // TODO: Загружать имя каталога карточки из скрипта
 static const char *card_dest = "/run/media/nagolove/4A3F-0331/";
@@ -75,7 +76,7 @@ static const char *replacer_date() {
 // XXX: Обрати внимание, как будет работать замена при наличии шаблонов
 // $MAKE, $MAK, $MA
 // Гарантировано работает только с разными шаблонами.
-static struct {
+static struct Replacer {
     const char *pattern;
     const char *(*fun)();
 } replacers[] = {
@@ -104,11 +105,12 @@ static struct {
 // Находит самый слева расположенный шаблон из всех для данной строки.
 // Возвращает указатель на начало найденной строки и значение индекса массива
 // replacers с найденным шаблоном.
-static const char *find_leftest(const char *in, int *i) {
+static const char *find_leftest(
+    const char *in, int *i, struct Replacer *replacers, int replacers_num
+) {
     assert(in);
     assert(i);
     //printf("find_leftest: '%s'\n", in);
-    int replacers_num = sizeof(replacers) / sizeof(replacers[0]);
     char *positions[replacers_num];
     int positions_i[replacers_num];
 
@@ -134,8 +136,21 @@ static const char *find_leftest(const char *in, int *i) {
     return leftest;
 }
 
+// строка состоит только из пробелов и табуляций?
+static bool empty_string(const char *line) {
+    while (*line) {
+        if (*line != ' ' && *line != '\t')
+            return false;
+        line++;
+    }
+    return true;
+}
+
 // CHALLENGE: do resolve() recursive!
-static const char *resolve(const char *in) {
+// Делает замены в строке in на строки из replacers
+static const char *resolve(
+    const char *in, struct Replacer *replacers, int replacers_num
+) {
     static char buf[256] = {};
     memset(buf, 0, sizeof(buf));
     const char *pin = in;
@@ -149,7 +164,7 @@ static const char *resolve(const char *in) {
         bool found = false;
 
         int i = -1;
-        const char *pattern = find_leftest(pin, &i);
+        const char *pattern = find_leftest(pin, &i, replacers, replacers_num);
         //printf("i %d\n", i);
         if (pattern) {
             int pattern_len = strlen(replacers[i].pattern);
@@ -161,9 +176,9 @@ static const char *resolve(const char *in) {
 
             pin += pattern - pin;
 
-            const char *fun_value = replacers[i].fun();
-            if (fun_value) {
-                chunks[chunks_num] = strdup(fun_value);
+            const char *fun_str = replacers[i].fun();
+            if (fun_str && !empty_string(fun_str)) {
+                chunks[chunks_num] = strdup(fun_str);
                 if (chunks_num == chunks_max)
                     goto _too_much_chunks;
                 chunks_num++;
@@ -174,7 +189,7 @@ static const char *resolve(const char *in) {
         }
 
         if (!found && pin) {
-            printf("pin '%s'\n", pin);
+            //printf("pin '%s'\n", pin);
             if (chunks_num == chunks_max)
                 goto _too_much_chunks;
             chunks[chunks_num++] = strdup(pin);
@@ -203,13 +218,20 @@ _return:
 static bool do_actions(char **lines, int lines_num) {
     assert(lines);
     assert(lines_num);
+    int replacers_num = sizeof(replacers) / sizeof(replacers[0]);
     for (int i = 0; i < lines_num; i++) {
         char resolved_action[2048] = {};
         printf("do_actions: '%s'\n", lines[i]);
-        strcat(resolved_action, resolve(lines[i]));
+        strcat(resolved_action, resolve(lines[i], replacers, replacers_num));
         // Как проверять корректность вызова функций через system()?
+        clock_t time1 = clock();
         int retcode = system(resolved_action);
-        printf("do_actions: system \"%s\" %d\n", resolved_action, retcode);
+        clock_t time2 = clock();
+        float time_meausure = (time2 - time1) / (float)CLOCKS_PER_SEC;
+        printf(
+            "do_actions: system \"%s\" finished for %.f sec(s) with %d\n",
+            resolved_action, time_meausure, retcode
+        );
     }
     return true;
 }
@@ -217,7 +239,7 @@ static bool do_actions(char **lines, int lines_num) {
 static bool has_lock() {
     char lock_path[512] = {};
     strcat(lock_path, card_dest);
-    strcat(lock_path, ".backupd_lock");
+    strcat(lock_path, lock_name);
     FILE *lock = fopen(lock_path, "r");
     if (!lock) 
         return false;
@@ -230,7 +252,7 @@ static bool write_last_backup_time(time_t last_time) {
 
     char accum_path[512] = {};
     strcat(accum_path, card_dest);
-    strcat(accum_path, "accum.txt");
+    strcat(accum_path, lock_name);
 
     FILE *accum = fopen(accum_path, "a");
 
@@ -312,16 +334,6 @@ static void remove_comment(char *line) {
     }
 }
 
-// строка состоит только из пробелов и табуляций?
-static bool empty_string(const char *line) {
-    while (*line) {
-        if (*line != ' ' && *line != '\t')
-            return false;
-        line++;
-    }
-    return true;
-}
-
 static struct Script script_load(const char *fname) {
     struct Script sc = {};
     FILE *script = fopen(fname, "r");
@@ -388,20 +400,25 @@ static void umount() {
 static void do_backup() {
     printf("do_backup:\n");
 
+    mount();
     if (!has_lock()) {
         printf("do_backup: where is no lock\n");
+        return;
     }
 
     time_t last_time = 0;
     if (read_last_backup_time(&last_time)) {
-         time_last_backup = last_time;
+        //if (last_time 
+        // TODO: Проверку на time_period
         struct Script sc = script_load(get_script_fname());
         script_print(sc);
         if (do_actions(sc.lines, sc.lines_num)) {
-            write_last_backup_time(time(NULL));
+            time_last_backup = time(NULL);
+            write_last_backup_time(time_last_backup);
         }
         script_shutdown(&sc);
     }
+    umount();
 }
 
 static void sig_sigint_handler(int sig) {
@@ -455,7 +472,7 @@ static void exit_handler() {
     printf("exit_handler:\n");
 }
 
-static void loop() {
+static void udev_loop() {
     const char *pipe_cmd = "udevadm monitor";
     FILE *pipe = popen(pipe_cmd, "r");
 
@@ -508,5 +525,5 @@ int main() {
     setup_signals();
     //atexit(exit_handler);
     do_backup();
-    loop();
+    udev_loop();
 }
