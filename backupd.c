@@ -9,7 +9,13 @@
 #include <time.h>
 #include <unistd.h>
 
+struct Script {
+    char **lines;
+    int lines_num;
+};
+
 static const char *script_name = ".backupdrc";
+// TODO: Загружать имя каталога карточки из скрипта
 static const char *card_dest = "/run/media/nagolove/4A3F-0331/";
 // время последней резервной записи
 static time_t time_last_backup; 
@@ -24,12 +30,6 @@ static const char *get_script_fname() {
     strcat(buf, "/");
     strcat(buf, script_name);
     printf("get_script_fname: %s\n", buf);
-    return buf;
-}
-
-static const char *replacer_love() {
-    static char buf[128] = {};
-    sprintf(buf, "love");
     return buf;
 }
 
@@ -95,16 +95,10 @@ static struct {
         .pattern = "$POPD",
         .fun = replacer_popd,
     },
-    /*
     {
         .pattern = "$KISS",
         .fun = replacer_kiss,
     },
-    {
-        .pattern = "$LOVE",
-        .fun = replacer_love,
-    },
-    */
 };
 
 // Находит самый слева расположенный шаблон из всех для данной строки.
@@ -144,9 +138,7 @@ static const char *find_leftest(const char *in, int *i) {
 static const char *resolve(const char *in) {
     static char buf[256] = {};
     memset(buf, 0, sizeof(buf));
-    char *pbuf = buf;
     const char *pin = in;
-    int replacers_num = sizeof(replacers) / sizeof(replacers[0]);
 
     int chunks_max = 128;
     char *chunks[chunks_max];
@@ -163,6 +155,8 @@ static const char *resolve(const char *in) {
             int pattern_len = strlen(replacers[i].pattern);
 
             chunks[chunks_num] = strndup(pin, pattern - pin);
+            if (chunks_num == chunks_max) 
+                goto _too_much_chunks;
             chunks_num++;
 
             pin += pattern - pin;
@@ -170,7 +164,8 @@ static const char *resolve(const char *in) {
             const char *fun_value = replacers[i].fun();
             if (fun_value) {
                 chunks[chunks_num] = strdup(fun_value);
-                /*strcpy(chunks[chunks_num], replacers[i].fun());*/
+                if (chunks_num == chunks_max)
+                    goto _too_much_chunks;
                 chunks_num++;
             }
 
@@ -180,6 +175,8 @@ static const char *resolve(const char *in) {
 
         if (!found && pin) {
             printf("pin '%s'\n", pin);
+            if (chunks_num == chunks_max)
+                goto _too_much_chunks;
             chunks[chunks_num++] = strdup(pin);
             break;
         }
@@ -194,20 +191,27 @@ static const char *resolve(const char *in) {
         if (chunks[i])
             free(chunks[i]);
 
+    goto _return;
+_too_much_chunks:
+    fprintf(stderr, "resolve: too much chunks %d\n", chunks_num);
+    exit(EXIT_FAILURE);
+_return:
     //printf("resolve: buf '%s'\n", buf);
     return buf;
 }
 
-static void do_actions(char **lines, int lines_num) {
+static bool do_actions(char **lines, int lines_num) {
     assert(lines);
     assert(lines_num);
     for (int i = 0; i < lines_num; i++) {
         char resolved_action[2048] = {};
         printf("do_actions: '%s'\n", lines[i]);
         strcat(resolved_action, resolve(lines[i]));
+        // Как проверять корректность вызова функций через system()?
         int retcode = system(resolved_action);
         printf("do_actions: system \"%s\" %d\n", resolved_action, retcode);
     }
+    return true;
 }
 
 static bool has_lock() {
@@ -220,6 +224,38 @@ static bool has_lock() {
     fclose(lock);
     return true;
 }
+
+static bool write_last_backup_time(time_t last_time) {
+    bool status = false;
+
+    char accum_path[512] = {};
+    strcat(accum_path, card_dest);
+    strcat(accum_path, "accum.txt");
+
+    FILE *accum = fopen(accum_path, "a");
+
+    if (!accum) {
+        goto _after_cleanup;
+    }
+
+    int num = fprintf(accum, "%lu", last_time);
+    if (num != 1) {
+        fprintf(
+            stderr, "write_last_backup_time: could not write time to file\n"
+        );
+        if (errno)
+            fprintf(
+                stderr, "write_last_backup_time: error '%s'\n", strerror(errno)
+            );
+    }
+
+    fclose(accum);
+    status = true;
+
+_after_cleanup:
+    return status;
+}
+
 
 static bool read_last_backup_time(time_t *last_time) {
     bool status = false;
@@ -256,11 +292,6 @@ _after_cleanup:
     return status;
 }
 
-struct Script {
-    char **lines;
-    int lines_num;
-};
-
 // удалить последний символ перевода строки
 // XXX: unix-only
 static void remove_caret(char *line) {
@@ -291,7 +322,7 @@ static bool empty_string(const char *line) {
     return true;
 }
 
-struct Script script_load(const char *fname) {
+static struct Script script_load(const char *fname) {
     struct Script sc = {};
     FILE *script = fopen(fname, "r");
     if (!script) {
@@ -323,7 +354,7 @@ struct Script script_load(const char *fname) {
     return sc;
 }
 
-void script_print(struct Script sc) {
+static void script_print(struct Script sc) {
     if (!sc.lines)
         return;
     for (int i = 0; i < sc.lines_num; i++) {
@@ -331,7 +362,7 @@ void script_print(struct Script sc) {
     }
 }
 
-void script_shutdown(struct Script *sc) {
+static void script_shutdown(struct Script *sc) {
     if (!sc->lines)
         return;
     for (int j = 0; j < sc->lines_num; j++) {
@@ -342,65 +373,55 @@ void script_shutdown(struct Script *sc) {
     memset(sc, 0, sizeof(*sc));
 }
 
+static void mount() {
+    // TODO: Путь к устройству задавать в скрипте
+    int errcode = system("udisksctl mount -b /dev/sdb1");
+    printf("mount: with code %d\n", errcode);
+}
+
+static void umount() {
+    // TODO: Путь к устройству задавать в скрипте
+    int errcode = system("udisksctl unmount -b /dev/sdb1");
+    printf("umount: with code %d\n", errcode);
+}
+
 static void do_backup() {
     printf("do_backup:\n");
 
-    /*
-    int errcode;
-    errcode = system("udisksctl mount -b /dev/sdb1");
-    printf("mount with code %d\n", errcode);
+    if (!has_lock()) {
+        printf("do_backup: where is no lock\n");
+    }
 
-    char accum_path[512] = {};
-    strcat(accum_path, card_dest);
-    strcat(accum_path, "accum.txt");
-    FILE *accum = fopen(accum_path, "a");
-    if (!accum) 
-        goto _after_cleanup;
-
-    time_t now = time(NULL);
-    struct tm tm = *localtime(&now);
-    fprintf(
-        accum, "%.4dy_%.2dm_%dd_%dh-%dm-%ds\n",
-        tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec
-    );
-    fprintf(accum, "unixtime %lu\n", time_last_backup);
-    // */
-
-    struct Script sc = script_load(get_script_fname());
-    script_print(sc);
-    //do_actions(sc.lines, sc.lines_num);
-    script_shutdown(&sc);
-
-    /*
-    time_last_backup = now;
-
-    fclose(accum);
-
-_after_cleanup:
-
-    errcode = system("udisksctl unmount -b /dev/sdb1");
-    printf("umount with code %d\n", errcode);
-    // */
+    time_t last_time = 0;
+    if (read_last_backup_time(&last_time)) {
+         time_last_backup = last_time;
+        struct Script sc = script_load(get_script_fname());
+        script_print(sc);
+        if (do_actions(sc.lines, sc.lines_num)) {
+            write_last_backup_time(time(NULL));
+        }
+        script_shutdown(&sc);
+    }
 }
 
-void sig_sigint_handler(int sig) {
+static void sig_sigint_handler(int sig) {
     printf("sigint\n");
     exit(EXIT_SUCCESS);
 }
 
-void sig_sigill_handler(int sig) {
+static void sig_sigill_handler(int sig) {
     printf("sigill\n");
 }
 
-void sig_sigabrt_handler(int sig) {
+static void sig_sigabrt_handler(int sig) {
     printf("sigabrt\n");
 }
 
-void sig_sigfpe_handler(int sig) {
+static void sig_sigfpe_handler(int sig) {
     printf("sigfpe\n");
 }
 
-void sig_sigsegv_handler(int sig) {
+static void sig_sigsegv_handler(int sig) {
     printf("sigsegv\n");
     int num = 100;
     void *trace[num];
@@ -409,73 +430,39 @@ void sig_sigsegv_handler(int sig) {
     exit(EXIT_FAILURE);
 }
 
-void sig_sigterm_handler(int sig) {
+static void sig_sigterm_handler(int sig) {
     printf("sigterm\n");
     exit(EXIT_SUCCESS);
 }
 
-void sig_sighup_handler(int sig) {
+static void sig_sighup_handler(int sig) {
     printf("sighup\n");
 }
 
-void sig_sigquit_handler(int sig) {
+static void sig_sigquit_handler(int sig) {
     printf("sigquit\n");
 }
 
-void sig_sigtrap_handler(int sig) {
+static void sig_sigtrap_handler(int sig) {
     printf("sigtrap\n");
 }
 
-void sig_sigkill_handler(int sig) {
+static void sig_sigkill_handler(int sig) {
     printf("sigkill\n");
 }
 
-void exit_handler() {
+static void exit_handler() {
+    printf("exit_handler:\n");
 }
 
-
-/*
-    Попытаться прочитать с флешки последнее время обновления
-
-    Если не успешно, то впасть в цикл чтения событий udev
-
-    Если разница с текущим временем больше установленной(30 минут к примеру),
-    то произвести резервное копирование.
-
-    Записать на флешку время последнего копирования.
-*/
-int main() {
-
-    signal(SIGINT, sig_sigint_handler);     /* Interactive attention signal.  */
-    signal(SIGILL, sig_sigill_handler);     /* Illegal instruction.  */
-    signal(SIGABRT, sig_sigabrt_handler);   /* Abnormal termination.  */
-    signal(SIGFPE, sig_sigfpe_handler);     /* Erroneous arithmetic operation.  */
-    signal(SIGSEGV, sig_sigsegv_handler);   /* Invalid access to storage.  */
-    signal(SIGTERM, sig_sigterm_handler);   /* Termination request.  */
-    signal(SIGHUP, sig_sighup_handler);     /* Hangup.  */
-    signal(SIGQUIT, sig_sigquit_handler);   /* Quit.  */
-    signal(SIGTRAP, sig_sigtrap_handler);   /* Trace/breakpoint trap.  */
-    signal(SIGKILL, sig_sigkill_handler);   /* Killed.  */
-
-    /*
-    time_t last_time = 0;
-    if (read_last_backup_time(&last_time)) {
-        printf("read_last_backup_time: success\n");
-    }
-    printf("time %s\n", ctime(&last_time));
-    */
-
-    /*do_actions((char**)actions, sizeof(actions) / sizeof(actions[0]));*/
-
-    atexit(exit_handler);
-
-    do_backup();
-    /*
-     
-    FILE *pipe = popen("udevadm monitor", "r");
+static void loop() {
+    const char *pipe_cmd = "udevadm monitor";
+    FILE *pipe = popen(pipe_cmd, "r");
 
     if (!pipe) {
-        printf("could not open pipe %s\n", strerror(errno));
+        printf(
+            "could not open pipe '%s' with %s\n", pipe_cmd, strerror(errno)
+        );
         exit(EXIT_FAILURE);
     }
 
@@ -484,7 +471,7 @@ int main() {
 
     do {
         printf("line %s\n", line);
-        // ^UDEV  [5390.581842] change   /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host5/target5:0:0/5:0:0:0/block/sdb (block)
+        // TODO: Добавить строчки поиска новых устройств в скрипт?
         if (strstr(line, "UDEV") && 
             strstr(line, "add") &&
             strstr(line, "/devices/pci0000:00/") &&
@@ -495,5 +482,31 @@ int main() {
     } while (strlen(line));
 
     pclose(pipe);
-    */
+}
+
+static void setup_signals() {
+    signal(SIGINT, sig_sigint_handler);     /* Interactive attention signal.  */
+    signal(SIGILL, sig_sigill_handler);     /* Illegal instruction.  */
+    signal(SIGABRT, sig_sigabrt_handler);   /* Abnormal termination.  */
+    signal(SIGFPE, sig_sigfpe_handler);     /* Erroneous arithmetic operation.  */
+    signal(SIGSEGV, sig_sigsegv_handler);   /* Invalid access to storage.  */
+    signal(SIGTERM, sig_sigterm_handler);   /* Termination request.  */
+    signal(SIGHUP, sig_sighup_handler);     /* Hangup.  */
+    signal(SIGQUIT, sig_sigquit_handler);   /* Quit.  */
+    signal(SIGTRAP, sig_sigtrap_handler);   /* Trace/breakpoint trap.  */
+    signal(SIGKILL, sig_sigkill_handler);   /* Killed.  */
+}
+
+/*
+    Попытаться прочитать с флешки последнее время обновления
+    Если не успешно, то впасть в цикл чтения событий udev
+    Если разница с текущим временем больше установленной(30 минут к примеру),
+    то произвести резервное копирование.
+    Записать на флешку время последнего копирования.
+*/
+int main() {
+    setup_signals();
+    //atexit(exit_handler);
+    do_backup();
+    loop();
 }
